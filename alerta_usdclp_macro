@@ -1,0 +1,935 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+alerta_usdclp_macro.py
+
+Creado por José Ulloa
+
+Alerta USD/CLP + Macro (cobre/DXY/US10Y) + ML (prob simple) + Tendencia + Estacionalidad (robusta).
+
+Mejoras incluidas (resumen):
+- Silencia logs ruidosos de yfinance/urllib3.
+- Ticker robusto + fallback: prueba USDCLP=X y CLP=X; baja intervalos; si no hay intradía, usa diario.
+- Transparencia: imprime fuente del precio, timestamp del último dato y su “antigüedad” en minutos.
+- Corrección: “Apertura día” = primera vela del DÍA del último tick (no primera del lookback).
+- Mensaje de horario: heurística + opción --learn_hours (best-effort).
+- Estacionalidad robusta a pocos meses.
+- Defensas ante NaN e índices con/ sin TZ.
+- Compatible con Python 3.9+.
+
+Mejoras adicionales (esta versión):
+- `--force` NO activa fallback a spot diario por intradía STALE (force = mostrar intradía aunque esté viejo).
+- Flags: `--max_stale_min` y `--no_daily_fallback`.
+- Impresión explícita: “Spot usado: intraday/daily”.
+"""
+
+import logging
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+
+import sys
+import argparse
+import os
+from datetime import datetime
+from typing import Optional, Dict, Any, Tuple, List
+
+import pytz
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+
+# =========================
+# Config
+# =========================
+TZ = pytz.timezone("America/Santiago")
+
+TICKERS = {
+    "USDCLP": "USDCLP=X",
+    "COPPER": "HG=F",
+    "DXY": "DX-Y.NYB",
+    "US10Y": "^TNX",
+}
+
+# Technical thresholds
+THRESH_SPIKE_UP = 0.010
+THRESH_CHEAP_VS_MA10 = -0.012
+THRESH_EXPENSIVE_VS_MA10 = 0.012
+
+# Liquidity window (Chile) - heurística fija
+BEST_HOURS = (11, 13)      # 11:00–13:59
+BEST_DAYS = {1, 2, 3}      # Tue=1 Wed=2 Thu=3 (Mon=0)
+MARKET_OK_HOURS = (9, 15)  # 09:00–14:59
+
+# Macro
+MACRO_Z_WINDOW = 60
+MACRO_RET_DAYS = 5
+PRESSURE_STRONG = 1.0
+
+# ML thresholds
+PROB_HIGH = 0.62
+PROB_LOW = 0.38
+
+# Trend / Seasonality
+WEEKDAY_NAMES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+
+# Data-driven hours (if available)
+LEARN_HOURS_PERIOD = "5d"
+LEARN_HOURS_INTERVAL = "15m"
+LEARN_HOURS_MIN_BARS = 120
+LEARN_HOURS_TOPK = 3
+
+# USDCLP candidates
+USDCLP_CANDIDATES = ["USDCLP=X", "CLP=X"]
+
+
+# =========================
+# ANSI colors
+# =========================
+def supports_color() -> bool:
+    return sys.stdout.isatty()
+
+USE_COLOR = supports_color()
+
+def c(text: str, code: str) -> str:
+    if not USE_COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+def red(text: str) -> str: return c(text, "31")
+def yellow(text: str) -> str: return c(text, "33")
+def green(text: str) -> str: return c(text, "32")
+def bold(text: str) -> str: return c(text, "1")
+
+
+# =========================
+# Sound (macOS)
+# =========================
+def play_green_sound(enabled: bool, voice: str = "Jorge") -> None:
+    if not enabled:
+        return
+    if sys.platform != "darwin":
+        return
+    try:
+        os.system(f"say -v {voice} 'Semáforo verde. Buen momento para comprar dólares.'")
+    except Exception:
+        pass
+
+
+# =========================
+# Helpers
+# =========================
+def safe_item(x) -> float:
+    try:
+        return float(np.asarray(x).item())
+    except Exception:
+        try:
+            return float(x)
+        except Exception:
+            return float("nan")
+
+def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    return df
+
+def download_daily_close(ticker: str, period: str) -> pd.Series:
+    df = yf.download(
+        ticker, period=period, interval="1d",
+        progress=False, auto_adjust=True, threads=True
+    )
+    if df is None or df.empty:
+        raise RuntimeError(f"No daily data for {ticker}.")
+    df = _flatten_yf_columns(df)
+    if "Close" not in df.columns:
+        raise RuntimeError(f"Daily data for {ticker} has no Close.")
+    s = df["Close"].copy()
+    s.name = ticker
+    return s
+
+def _to_tz_chile_index(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    try:
+        if out.index.tz is None:
+            out.index = out.index.tz_localize("UTC").tz_convert("America/Santiago")
+        else:
+            out.index = out.index.tz_convert("America/Santiago")
+    except Exception:
+        return df
+    return out
+
+def _ensure_tzaware_chile(dt: datetime) -> datetime:
+    if not isinstance(dt, datetime):
+        return datetime.now(TZ)
+    try:
+        if dt.tzinfo is None:
+            return TZ.localize(dt)
+        return dt.astimezone(TZ)
+    except Exception:
+        return datetime.now(TZ)
+
+def _fmt_dt(dt: datetime) -> str:
+    try:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "n/a"
+
+def _compute_day_open_from_intraday(intra: pd.DataFrame) -> Tuple[float, datetime]:
+    intra_ch = _to_tz_chile_index(intra)
+    if intra_ch is None or intra_ch.empty:
+        return float("nan"), datetime.now(TZ)
+
+    last_idx = intra_ch.index[-1]
+    last_ts = last_idx.to_pydatetime() if hasattr(last_idx, "to_pydatetime") else last_idx
+    last_ts = _ensure_tzaware_chile(last_ts)
+
+    last_day = intra_ch.index[-1].date()
+    day_slice = intra_ch[intra_ch.index.date == last_day]
+
+    if not day_slice.empty and "Open" in day_slice.columns:
+        day_open = safe_item(day_slice["Open"].iloc[0])
+    else:
+        day_open = safe_item(intra_ch["Open"].iloc[-1]) if "Open" in intra_ch.columns else float("nan")
+
+    return day_open, last_ts
+
+
+# =========================
+# USDCLP intraday robust (ticker + interval fallback)
+# =========================
+def fetch_intraday_usdclp() -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    last_err = None
+    tries = [
+        ("1m", "1d"),
+        ("5m", "1d"),
+        ("15m", "5d"),
+        ("30m", "5d"),
+        ("60m", "10d"),
+    ]
+
+    for tk in USDCLP_CANDIDATES:
+        for interval, period in tries:
+            try:
+                df = yf.download(
+                    tk, period=period, interval=interval,
+                    progress=False, auto_adjust=True, threads=True
+                )
+                if df is None or df.empty:
+                    continue
+                df = _flatten_yf_columns(df)
+                if {"Open", "Close"}.issubset(df.columns):
+                    return df, {"source": "intraday", "ticker": tk, "interval": interval, "period": period}
+            except Exception as e:
+                last_err = e
+
+    for tk in USDCLP_CANDIDATES:
+        try:
+            df = yf.download(
+                tk, period="10d", interval="1d",
+                progress=False, auto_adjust=True, threads=True
+            )
+            if df is None or df.empty:
+                continue
+            df = _flatten_yf_columns(df)
+            if {"Open", "Close"}.issubset(df.columns):
+                return df, {"source": "daily_fallback", "ticker": tk, "interval": "1d", "period": "10d"}
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"No data para USDCLP (intradía ni diario). Last error: {last_err}")
+
+
+# =========================
+# Data-driven hours (optional)
+# =========================
+def fetch_intraday_recent(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    df = yf.download(
+        ticker, period=period, interval=interval,
+        progress=False, auto_adjust=True, threads=True
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = _flatten_yf_columns(df)
+    if "Close" not in df.columns:
+        return pd.DataFrame()
+    return df
+
+def is_good_liquidity_time(now_local: datetime) -> bool:
+    wd = now_local.weekday()
+    hr = now_local.hour
+    return (wd in BEST_DAYS) and (BEST_HOURS[0] <= hr <= BEST_HOURS[1])
+
+def is_market_ok_time(now_local: datetime) -> bool:
+    wd = now_local.weekday()
+    hr = now_local.hour
+    if wd in (5, 6):
+        return False
+    return MARKET_OK_HOURS[0] <= hr < MARKET_OK_HOURS[1]
+
+def liquidity_hint(now_local: datetime) -> str:
+    wd = now_local.weekday()
+    hr = now_local.hour
+    if is_good_liquidity_time(now_local):
+        return "✅ Horario/Día recomendado (alta liquidez)."
+    if wd in (5, 6):
+        return "⚠️ Fin de semana: spread suele ser peor."
+    if wd == 0 and hr < 11:
+        return "⚠️ Lunes temprano: suele haber más ruido/spread."
+    if wd == 4 and hr >= 15:
+        return "⚠️ Viernes tarde: suele empeorar el spread."
+    if hr < MARKET_OK_HOURS[0] or hr >= MARKET_OK_HOURS[1]:
+        return "⚠️ Fuera de horario de mercado: spread suele ser peor."
+    return "ℹ️ Horario intermedio: aceptable, pero no óptimo."
+
+def zscore(s: pd.Series, window: int) -> pd.Series:
+    mu = s.rolling(window=window, min_periods=max(10, window // 3)).mean()
+    sd = s.rolling(window=window, min_periods=max(10, window // 3)).std()
+    z = (s - mu) / sd
+    return z.replace([np.inf, -np.inf], np.nan)
+
+def learn_best_hours_usdclp(now_local: datetime) -> Dict[str, Any]:
+    df = fetch_intraday_recent(TICKERS["USDCLP"], LEARN_HOURS_PERIOD, LEARN_HOURS_INTERVAL)
+    if df.empty or len(df) < LEARN_HOURS_MIN_BARS:
+        return {"ok": False, "reason": f"datos intradía insuficientes (barras={len(df)})."}
+
+    df = _to_tz_chile_index(df)
+    if df.empty:
+        return {"ok": False, "reason": "no se pudo normalizar zona horaria en intradía."}
+
+    d = df[["Close"]].copy()
+    d["ret"] = d["Close"].pct_change().replace([np.inf, -np.inf], np.nan)
+    d = d.dropna()
+    if d.empty or len(d) < LEARN_HOURS_MIN_BARS // 2:
+        return {"ok": False, "reason": "retornos intradía insuficientes tras limpieza."}
+
+    d["weekday"] = d.index.weekday
+    d["hour"] = d.index.hour
+
+    d = d[(d["weekday"] <= 4) & (d["hour"] >= MARKET_OK_HOURS[0]) & (d["hour"] < MARKET_OK_HOURS[1])]
+    if d.empty:
+        return {"ok": False, "reason": "sin datos intradía dentro de horario de mercado."}
+
+    g = d.groupby(["weekday", "hour"])["ret"].agg(
+        abs_mean=lambda x: float(np.nanmean(np.abs(x))),
+        mean=lambda x: float(np.nanmean(x)),
+        count="count",
+    ).reset_index()
+
+    g = g[g["count"] >= 6]
+    if g.empty:
+        return {"ok": False, "reason": "muy pocas muestras por bloque horario."}
+
+    g["score"] = g["abs_mean"] + 0.2 * np.maximum(g["mean"], 0.0)
+    g = g.sort_values("score", ascending=True)
+
+    top = []
+    for _, row in g.head(LEARN_HOURS_TOPK).iterrows():
+        top.append((int(row["weekday"]), int(row["hour"]), float(row["score"]), int(row["count"])))
+
+    blocks = [f"{WEEKDAY_NAMES[wd]} {hr:02d}:00–{hr:02d}:59 (n={cnt})" for wd, hr, _, cnt in top]
+    sug = " | ".join(blocks)
+
+    best_wd, best_hr, _, _ = top[0]
+    return {
+        "ok": True,
+        "top": top,
+        "best_weekday": best_wd,
+        "best_hour": best_hr,
+        "suggestion_text": (
+            f"Aprendido (intradía {LEARN_HOURS_PERIOD}/{LEARN_HOURS_INTERVAL}): "
+            f"mejor bloque ≈ {WEEKDAY_NAMES[best_wd]} {best_hr:02d}:00–{best_hr:02d}:59. Top: {sug}"
+        ),
+    }
+
+def market_hours_gate_message(now_local: datetime, learned: Optional[Dict[str, Any]]) -> str:
+    base = "Heurística de liquidez: suele convenir ejecutar entre 11:00–13:00 (Chile)."
+    if learned and learned.get("ok"):
+        return base + " " + learned.get("suggestion_text", "").strip()
+    return base
+
+
+# =========================
+# Macro
+# =========================
+def compute_macro_components(daily: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=daily.index)
+
+    out["dxy_ret_5d"] = daily["DXY"].pct_change(MACRO_RET_DAYS)
+    out["us10y_ret_5d"] = daily["US10Y"].pct_change(MACRO_RET_DAYS)
+    out["copper_ret_5d"] = daily["COPPER"].pct_change(MACRO_RET_DAYS)
+
+    out["dxy_z"] = zscore(out["dxy_ret_5d"], MACRO_Z_WINDOW).fillna(0)
+    out["us10y_z"] = zscore(out["us10y_ret_5d"], MACRO_Z_WINDOW).fillna(0)
+    out["copper_z"] = zscore(out["copper_ret_5d"], MACRO_Z_WINDOW).fillna(0)
+
+    out["usd_pressure"] = out["dxy_z"] + out["us10y_z"] - out["copper_z"]
+    return out
+
+
+# =========================
+# Trend + Seasonality
+# =========================
+def trend_summary(usd_daily: pd.Series) -> Dict[str, Any]:
+    s = usd_daily.dropna()
+    if len(s) < 220:
+        return {
+            "label": "n/a (datos insuficientes)",
+            "ma20": np.nan, "ma50": np.nan, "ma200": np.nan,
+            "slope30": np.nan, "slope30_pct": np.nan,
+            "ret20": np.nan, "ret60": np.nan,
+        }
+
+    ma20 = safe_item(s.rolling(20).mean().iloc[-1])
+    ma50 = safe_item(s.rolling(50).mean().iloc[-1])
+    ma200 = safe_item(s.rolling(200).mean().iloc[-1])
+
+    last = s.tail(30)
+    x = np.arange(len(last))
+    y = last.values
+    slope = np.polyfit(x, y, 1)[0]
+    slope_pct = (slope / safe_item(s.iloc[-1])) * 100.0
+
+    ret20 = safe_item(s.pct_change(20).iloc[-1]) * 100.0
+    ret60 = safe_item(s.pct_change(60).iloc[-1]) * 100.0
+
+    if ma20 > ma50 > ma200 and slope > 0:
+        label = "ALCISTA"
+    elif ma20 < ma50 < ma200 and slope < 0:
+        label = "BAJISTA"
+    else:
+        label = "LATERAL / MIXTA"
+
+    return {
+        "label": label,
+        "ma20": ma20, "ma50": ma50, "ma200": ma200,
+        "slope30": slope, "slope30_pct": slope_pct,
+        "ret20": ret20, "ret60": ret60,
+    }
+
+def _confidence_label(total_rows: int, min_per_wd: int, counts_by_wd: pd.Series) -> str:
+    min_cnt = int(counts_by_wd.min()) if len(counts_by_wd) else 0
+    if total_rows >= 120 and min_cnt >= max(8, min_per_wd):
+        return "alta"
+    if total_rows >= 70 and min_cnt >= max(5, min_per_wd):
+        return "media"
+    return "baja"
+
+def seasonality_best_day(
+    usd_daily: pd.Series,
+    months: int = 6,
+    min_rows: int = 40,
+    min_per_weekday: int = 3,
+) -> Dict[str, Any]:
+    s = usd_daily.dropna()
+    if s.empty:
+        return {"ok": False, "reason": "serie vacía"}
+
+    cutoff = s.index.max() - pd.DateOffset(months=months)
+    s2 = s[s.index >= cutoff]
+
+    method = "raw_level"
+    resid = None
+
+    if len(s2) >= 55:
+        ma50 = s2.rolling(50, min_periods=25).mean()
+        r = (s2 / ma50) - 1.0
+        r = r.dropna()
+        if len(r) >= min_rows:
+            resid = r
+            method = "detrend_ma50"
+
+    if resid is None and len(s2) >= 28:
+        ma20 = s2.rolling(20, min_periods=10).mean()
+        r = (s2 / ma20) - 1.0
+        r = r.dropna()
+        if len(r) >= max(25, min_rows // 2):
+            resid = r
+            method = "detrend_ma20"
+
+    if resid is None:
+        resid = s2.copy()
+        method = "raw_level"
+
+    df = pd.DataFrame({"x": resid})
+    df["weekday"] = df.index.weekday
+
+    by = df.groupby("weekday")["x"].agg(["median", "mean", "count"]).sort_index()
+    for wd in range(7):
+        if wd not in by.index:
+            by.loc[wd] = [np.nan, np.nan, 0]
+    by = by.sort_index()
+
+    counts = by["count"].astype(int)
+    conf = _confidence_label(len(df), min_per_weekday, counts[counts > 0])
+    too_sparse = (counts[counts > 0].min() if (counts > 0).any() else 0) < min_per_weekday
+
+    med_series = by["median"].replace([np.inf, -np.inf], np.nan).dropna()
+    if med_series.empty:
+        return {"ok": False, "reason": "no se pudo calcular estacionalidad (NaN)", "method": method}
+
+    best_idx = int(med_series.idxmin())
+    worst_idx = int(med_series.idxmax())
+
+    return {
+        "ok": True,
+        "months": months,
+        "method": method,
+        "confidence": conf,
+        "too_sparse": bool(too_sparse),
+        "min_per_weekday": min_per_weekday,
+        "rows_used": int(len(df)),
+        "table": by,
+        "best_day": best_idx,
+        "worst_day": worst_idx,
+        "best_day_name": WEEKDAY_NAMES[best_idx],
+        "worst_day_name": WEEKDAY_NAMES[worst_idx],
+        "best_median": float(by.loc[best_idx, "median"]),
+        "worst_median": float(by.loc[worst_idx, "median"]),
+    }
+
+
+# =========================
+# Recommendation
+# =========================
+def recommend_core(spot: float, day_open: float, ma10: float, pressure: float) -> Tuple[str, str, float, float]:
+    intraday_ret = (spot / day_open) - 1.0 if (np.isfinite(day_open) and day_open > 0) else float("nan")
+    dev_ma10 = (spot / ma10) - 1.0 if (np.isfinite(ma10) and ma10 > 0) else float("nan")
+    has_intraday = np.isfinite(intraday_ret)
+
+    if has_intraday and intraday_ret >= THRESH_SPIKE_UP and np.isfinite(dev_ma10) and dev_ma10 > 0:
+        action = "COMPRAR PARCIAL"
+        rationale = (
+            f"Subida intradía {intraday_ret*100:.2f}% y sobre MA10 ({dev_ma10*100:.2f}%). "
+            "Evita comprar todo en el pico."
+        )
+    elif np.isfinite(dev_ma10) and dev_ma10 <= THRESH_CHEAP_VS_MA10:
+        action = "COMPRAR"
+        rationale = f"Está {dev_ma10*100:.2f}% bajo MA10 (barato relativo)."
+    elif np.isfinite(dev_ma10) and dev_ma10 >= THRESH_EXPENSIVE_VS_MA10:
+        action = "ESPERAR"
+        rationale = f"Está {dev_ma10*100:.2f}% sobre MA10 (caro relativo)."
+    else:
+        action = "COMPRAR PARCIAL"
+        rationale = (
+            f"Cerca de MA10 ({dev_ma10*100:.2f}%). Compra en 2–3 partes."
+            if np.isfinite(dev_ma10) else
+            "Señal técnica parcial (datos incompletos). Compra en 2–3 partes."
+        )
+
+    if np.isfinite(pressure) and pressure >= PRESSURE_STRONG:
+        rationale += f" Macro: presión USD alta (score {pressure:.2f}) → sesgo alcista."
+        if action == "ESPERAR" and (not np.isfinite(dev_ma10) or dev_ma10 < (THRESH_EXPENSIVE_VS_MA10 + 0.01)):
+            action = "COMPRAR PARCIAL"
+            rationale += " Ajuste: compra parcial."
+    elif np.isfinite(pressure) and pressure <= -PRESSURE_STRONG:
+        rationale += f" Macro: presión USD baja (score {pressure:.2f}) → sesgo bajista."
+        if action == "COMPRAR PARCIAL" and (not np.isfinite(dev_ma10) or abs(dev_ma10) < 0.01):
+            action = "ESPERAR"
+            rationale += " Ajuste: esperar."
+
+    return action, rationale, intraday_ret, dev_ma10
+
+def apply_market_hours_gate(
+    action: str,
+    rationale: str,
+    now_local: datetime,
+    force: bool,
+    learned_hours: Optional[Dict[str, Any]],
+) -> Tuple[str, str]:
+    if force:
+        return action, rationale + " (FORCE activado)."
+    if not is_market_ok_time(now_local):
+        msg = market_hours_gate_message(now_local, learned_hours)
+        return "ESPERAR", rationale + f" Además estás fuera de horario; {msg}"
+    return action, rationale
+
+def suggest_buy_fraction(action: str) -> Tuple[float, str]:
+    if action == "COMPRAR":
+        return 1.0, "Compra 100% hoy (o 70/30 si quieres suavizar)."
+    if action == "COMPRAR PARCIAL":
+        return 0.4, "Compra 30%–50% hoy y el resto en 7–14 días o en la próxima caída."
+    return 0.0, "Espera 2–7 días y vuelve a correr el script."
+
+def estimate_amount(budget: float, mode: str, frac: float, spot_usdclp: float) -> str:
+    if frac <= 0:
+        return "Monto recomendado hoy: $0 (esperar)."
+    if mode == "clp":
+        clp = int(round((budget * frac) / 1000.0) * 1000)
+        est_usd = (clp / spot_usdclp) if spot_usdclp > 0 else 0.0
+        return f"Monto recomendado hoy: ${clp:,} CLP (≈ {est_usd:.0f} USD)."
+    usd = round(budget * frac, 2)
+    est_clp = int(round((usd * spot_usdclp) / 1000.0) * 1000)
+    return f"Monto recomendado hoy: {usd:.2f} USD (≈ ${est_clp:,} CLP)."
+
+
+# =========================
+# ML
+# =========================
+def build_ml_dataset(daily: pd.DataFrame, macro_df: pd.DataFrame, horizon_days: int = 5) -> pd.DataFrame:
+    df = daily.copy()
+
+    df["usd_ret_1d"] = df["USDCLP"].pct_change(1)
+    df["usd_ret_5d"] = df["USDCLP"].pct_change(5)
+    df["usd_ma10"] = df["USDCLP"].rolling(10, min_periods=5).mean()
+    df["usd_dev_ma10"] = (df["USDCLP"] / df["usd_ma10"]) - 1.0
+    df["usd_vol_5d"] = df["usd_ret_1d"].rolling(5, min_periods=5).std()
+
+    df["copper_ret_5d"] = macro_df["copper_ret_5d"]
+    df["dxy_ret_5d"] = macro_df["dxy_ret_5d"]
+    df["us10y_ret_5d"] = macro_df["us10y_ret_5d"]
+    df["usd_pressure"] = macro_df["usd_pressure"]
+
+    df["usd_future"] = df["USDCLP"].shift(-horizon_days)
+    df["y_up_5d"] = (df["usd_future"] > df["USDCLP"]).astype(int)
+
+    features = [
+        "usd_ret_1d", "usd_ret_5d", "usd_dev_ma10",
+        "copper_ret_5d", "dxy_ret_5d", "us10y_ret_5d",
+        "usd_pressure", "usd_vol_5d"
+    ]
+    return df[features + ["y_up_5d"]].dropna()
+
+def fit_predict_prob(daily: pd.DataFrame, macro_df: pd.DataFrame) -> Tuple[float, str]:
+    dataset = build_ml_dataset(daily, macro_df, horizon_days=5)
+    if len(dataset) < 180:
+        return np.nan, f"ML: datos insuficientes ({len(dataset)} filas)."
+
+    X = dataset.drop(columns=["y_up_5d"]).values
+    y = dataset["y_up_5d"].values
+
+    split = int(len(dataset) * 0.8)
+    X_train, y_train = X[:split], y[:split]
+    X_last = X[-1:].copy()
+
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(max_iter=2000, class_weight="balanced"))
+    ])
+    model.fit(X_train, y_train)
+
+    prob_up = float(model.predict_proba(X_last)[0, 1])
+    base_rate = float(y_train.mean())
+    dbg = f"ML: prob_up_5d={prob_up:.2f} (base_rate_train={base_rate:.2f}, n_train={len(y_train)})"
+    return prob_up, dbg
+
+
+# =========================
+# Traffic light + Score
+# =========================
+def traffic_light(action: str) -> str:
+    if action == "COMPRAR":
+        return green("🟢 COMPRAR")
+    if action == "COMPRAR PARCIAL":
+        return yellow("🟡 COMPRAR PARCIAL")
+    return red("🔴 ESPERAR")
+
+def compute_total_score(
+    dev_ma10: float,
+    intraday_ret: float,
+    pressure: float,
+    prob_up_5d: float,
+    now_local: datetime,
+    trend_label: str,
+    season_best: Optional[int],
+    season_conf: Optional[str],
+) -> int:
+    score = 55
+
+    if np.isfinite(dev_ma10):
+        score += int(np.clip((-dev_ma10) * 1800, -35, 35))
+    if np.isfinite(intraday_ret):
+        score -= int(np.clip(intraday_ret * 1200, 0, 12))
+    if np.isfinite(pressure):
+        score += int(np.clip(pressure * 4, -10, 10))
+
+    if np.isfinite(prob_up_5d):
+        score += int(np.clip((prob_up_5d - 0.5) * 60, -15, 15))
+
+    if is_good_liquidity_time(now_local):
+        score += 10
+    elif is_market_ok_time(now_local):
+        score += 5
+
+    if trend_label == "BAJISTA":
+        score += 5
+    elif trend_label == "ALCISTA":
+        score -= 5
+
+    if season_best is not None and now_local.weekday() == season_best:
+        bonus = 5 if season_conf in ("media", "alta") else 2
+        score += bonus
+
+    return int(np.clip(score, 0, 100))
+
+
+# =========================
+# CLI
+# =========================
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Alerta USD/CLP con macro + ML + semáforo + tendencia + estacionalidad (robusta a pocos meses)."
+    )
+    p.add_argument("--budget", type=float, default=300000)
+    p.add_argument("--mode", choices=["clp", "usd"], default="clp")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--period", default="2y")
+
+    p.add_argument("--season_months", type=int, default=6)
+    p.add_argument("--season_min_rows", type=int, default=40)
+    p.add_argument("--season_min_per_weekday", type=int, default=3)
+
+    p.add_argument("--learn_hours", action="store_true",
+                   help="Intentar sugerir ventana horaria desde intradía reciente (si hay datos).")
+
+    # NUEVO
+    p.add_argument("--max_stale_min", type=int, default=120,
+                   help="Umbral para marcar intradía como STALE (minutos). Default 120.")
+    p.add_argument("--no_daily_fallback", action="store_true",
+                   help="Desactiva fallback a spot diario cuando el intradía está STALE (siempre usa intradía).")
+
+    p.add_argument("--sound", action="store_true")
+    p.add_argument("--voice", default="Jorge")
+    return p.parse_args()
+
+
+# =========================
+# Main
+# =========================
+def main():
+    args = parse_args()
+    now = datetime.now(TZ)
+
+    learned_hours = None
+    if args.learn_hours:
+        learned_hours = learn_best_hours_usdclp(now)
+
+    # Daily base
+    daily_series = {}
+    for key, ticker in TICKERS.items():
+        s = download_daily_close(ticker, period=args.period)
+        s.name = key
+        daily_series[key] = s
+    daily = pd.concat(daily_series.values(), axis=1).dropna()
+
+    trend = trend_summary(daily["USDCLP"])
+    seas = seasonality_best_day(
+        daily["USDCLP"],
+        months=args.season_months,
+        min_rows=args.season_min_rows,
+        min_per_weekday=args.season_min_per_weekday,
+    )
+    ma10 = safe_item(daily["USDCLP"].rolling(10, min_periods=5).mean().iloc[-1])
+
+    macro_df = compute_macro_components(daily)
+    macro_last = macro_df.iloc[-1]
+    pressure = safe_item(macro_last["usd_pressure"])
+
+    # Intraday
+    intra, intra_meta = fetch_intraday_usdclp()
+    intra_ch = _to_tz_chile_index(intra)
+
+    day_open, last_ts_ch = _compute_day_open_from_intraday(intra_ch)
+    last_ts_ch = _ensure_tzaware_chile(last_ts_ch)
+
+    age_min = (now - last_ts_ch).total_seconds() / 60.0
+    stale = bool(np.isfinite(age_min) and age_min > float(args.max_stale_min))
+
+    # Spot intradía (por defecto)
+    spot_intraday = safe_item(intra_ch["Close"].iloc[-1]) if (intra_ch is not None and not intra_ch.empty) else float("nan")
+
+    # Spot diario (close) por si hacemos fallback
+    spot_daily = safe_item(daily["USDCLP"].iloc[-1])
+
+    # Regla: fallback SOLO si:
+    # - es intraday (no daily_fallback),
+    # - está STALE,
+    # - NO estás en --force,
+    # - y NO pusiste --no_daily_fallback
+    use_daily_spot = (
+        intra_meta.get("source") == "intraday"
+        and stale
+        and (not args.force)
+        and (not args.no_daily_fallback)
+    )
+
+    if use_daily_spot:
+        spot_used = spot_daily
+        spot_used_kind = "daily_close (fallback por STALE intradía)"
+        day_open_used = float("nan")   # no inventamos apertura intradía si estamos usando daily
+        intraday_ret = float("nan")
+    else:
+        spot_used = spot_intraday
+        spot_used_kind = "intraday"
+        day_open_used = day_open
+        intraday_ret = (spot_used / day_open_used) - 1.0 if (np.isfinite(day_open_used) and day_open_used > 0) else float("nan")
+
+    # Recomendación
+    action0, rationale0, intraday_ret_core, dev_ma10 = recommend_core(spot_used, day_open_used, ma10, pressure)
+    intraday_ret_use = intraday_ret if np.isfinite(intraday_ret) else intraday_ret_core
+
+    action, rationale = apply_market_hours_gate(action0, rationale0, now, force=args.force, learned_hours=learned_hours)
+
+    # ML
+    prob_up_5d, ml_dbg = fit_predict_prob(daily, macro_df)
+
+    if np.isfinite(prob_up_5d):
+        if prob_up_5d >= PROB_HIGH and action == "ESPERAR":
+            action = "COMPRAR PARCIAL"
+            rationale += f" ML: prob. alta de subida 5d ({prob_up_5d:.2f}) → compra parcial en horario bueno."
+        elif prob_up_5d <= PROB_LOW and action in ("COMPRAR", "COMPRAR PARCIAL"):
+            action = "ESPERAR"
+            rationale += f" ML: prob. baja de subida 5d ({prob_up_5d:.2f}) → esperar podría convenir."
+        elif prob_up_5d <= PROB_LOW and action == "ESPERAR" and "ML:" not in rationale:
+            rationale += f" ML: prob. baja de subida 5d ({prob_up_5d:.2f}) → refuerza esperar."
+
+    if stale and intra_meta.get("source") == "intraday":
+        rationale += f" Nota: intradía STALE ({age_min:.0f} min; umbral {args.max_stale_min})."
+        if use_daily_spot:
+            rationale += " Se usó spot diario (close) como referencia."
+        else:
+            rationale += " Se mantuvo spot intradía por FORCE/flag."
+
+    season_best = seas.get("best_day") if seas.get("ok") else None
+    season_conf = seas.get("confidence") if seas.get("ok") else None
+
+    score = compute_total_score(
+        dev_ma10, intraday_ret_use, pressure, prob_up_5d,
+        now, trend.get("label", "n/a"), season_best, season_conf
+    )
+
+    light = traffic_light(action)
+    buy_frac, buy_tip = suggest_buy_fraction(action)
+    amount_str = estimate_amount(args.budget, args.mode, buy_frac, spot_used)
+    hint = liquidity_hint(now)
+
+    # Prints
+    print(bold("=== ALERTA USD/CLP + MACRO + ML + TENDENCIA + ESTACIONALIDAD ==="))
+    print(f"Fecha/hora Chile: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print()
+
+    print(bold("Mercado USDCLP"))
+    print(f"Fuente datos: {intra_meta['source']} | {intra_meta['ticker']} | {intra_meta['interval']} ({intra_meta['period']})")
+    print(f"Último tick: {_fmt_dt(last_ts_ch)} (Chile)")
+    tag = red(" (STALE)") if stale else ""
+    print(f"Antigüedad dato: {age_min:.0f} min{tag}")
+    print(f"Spot usado: {spot_used_kind}")
+    print(f"Spot USDCLP: {spot_used:.2f}")
+
+    if np.isfinite(day_open_used):
+        print(f"Apertura día (según último tick): {day_open_used:.2f}")
+        print(f"Retorno intradía (día del último tick): {intraday_ret_use*100:.2f}%")
+    else:
+        print("Apertura día: n/a (no disponible)")
+        print("Retorno intradía: n/a (no disponible)")
+
+    print(f"MA10 (diario): {ma10:.2f}")
+    if np.isfinite(dev_ma10):
+        print(f"Desvío vs MA10: {dev_ma10*100:.2f}%")
+    else:
+        print("Desvío vs MA10: n/a")
+    print(hint)
+
+    if args.learn_hours:
+        if learned_hours and learned_hours.get("ok"):
+            print(yellow("ℹ️ Horarios aprendidos: ") + learned_hours.get("suggestion_text", ""))
+        else:
+            reason = learned_hours.get("reason") if isinstance(learned_hours, dict) else "n/a"
+            print(yellow("ℹ️ Horarios aprendidos: ") + f"n/a ({reason})")
+    print()
+
+    print(bold("Macro (últimos 5 días)"))
+    print(f"DXY ret_5d:    {safe_item(macro_last['dxy_ret_5d'])*100:+.2f}%   z={safe_item(macro_last['dxy_z']):+.2f}")
+    print(f"US10Y ret_5d:  {safe_item(macro_last['us10y_ret_5d'])*100:+.2f}%   z={safe_item(macro_last['us10y_z']):+.2f}")
+    print(f"Cobre ret_5d:  {safe_item(macro_last['copper_ret_5d'])*100:+.2f}%   z={safe_item(macro_last['copper_z']):+.2f}")
+    print(f"Pressure = DXYz + US10Yz - CobreZ = {pressure:+.2f}")
+    print()
+
+    print(bold("Tendencia (diario)"))
+    print(f"Estado: {trend.get('label')}")
+    if np.isfinite(trend.get("ma20", np.nan)):
+        print(f"MA20={trend['ma20']:.2f}  MA50={trend['ma50']:.2f}  MA200={trend['ma200']:.2f}")
+        print(f"Pendiente 30d: {trend['slope30']:+.3f} CLP/día  (~{trend['slope30_pct']:+.3f}%/día)")
+        print(f"Retornos: 20d={trend['ret20']:+.2f}%  |  60d={trend['ret60']:+.2f}%")
+    print()
+
+    print(bold(f"Estacionalidad (últimos {args.season_months} meses, por día semana)"))
+    if seas.get("ok"):
+        tbl = seas["table"]
+        method = seas.get("method", "n/a")
+        conf = seas.get("confidence", "baja")
+        rows_used = seas.get("rows_used", 0)
+        too_sparse = seas.get("too_sparse", False)
+
+        conf_txt = conf
+        if conf == "alta":
+            conf_txt = green("alta")
+        elif conf == "media":
+            conf_txt = yellow("media")
+        else:
+            conf_txt = red("baja")
+
+        print(f"Método: {method} | Confianza: {conf_txt} | filas usadas: {rows_used}")
+        if too_sparse:
+            print(red("⚠️ Pocas muestras por día semana. Sugerencia: usa --season_months 4 a 9 para algo más estable."))
+
+        for wd in range(7):
+            med = float(tbl.loc[wd, "median"]) if pd.notna(tbl.loc[wd, "median"]) else np.nan
+            mean = float(tbl.loc[wd, "mean"]) if pd.notna(tbl.loc[wd, "mean"]) else np.nan
+            cnt = int(tbl.loc[wd, "count"])
+
+            tag2 = ""
+            if wd == seas["best_day"]:
+                tag2 = green("  ← mejor")
+            elif wd == seas["worst_day"]:
+                tag2 = red("  ← peor")
+
+            if method.startswith("detrend"):
+                if np.isfinite(med):
+                    print(f"{WEEKDAY_NAMES[wd]}: mediana={med*100:+.2f}% (mean={mean*100:+.2f}%, n={cnt}){tag2}")
+                else:
+                    print(f"{WEEKDAY_NAMES[wd]}: n/a (n={cnt})")
+            else:
+                if np.isfinite(med):
+                    print(f"{WEEKDAY_NAMES[wd]}: mediana={med:.2f} CLP (mean={mean:.2f} CLP, n={cnt}){tag2}")
+                else:
+                    print(f"{WEEKDAY_NAMES[wd]}: n/a (n={cnt})")
+
+        print(f"Sugerencia: corre la app preferentemente el día {green(seas['best_day_name'])} entre 11:00–13:00 (heurística).")
+    else:
+        print(f"n/a: {seas.get('reason')}")
+    print()
+
+    print(bold("ML (probabilidad simple)"))
+    if np.isfinite(prob_up_5d):
+        print(f"Probabilidad de SUBIR en 5 días: {prob_up_5d:.2f}")
+    else:
+        print("Probabilidad de SUBIR en 5 días: n/a")
+    print(ml_dbg)
+    print()
+
+    print(bold("Decisión"))
+    print(f"Semáforo: {light}   |   Score: {score}/100")
+    print(f"Razón: {rationale}")
+    print()
+    print(amount_str)
+    print("Sugerencia:", buy_tip)
+
+    if action == "COMPRAR":
+        play_green_sound(enabled=args.sound, voice=args.voice)
+
+
+if __name__ == "__main__":
+    try:
+        import pytz  # noqa: F401
+    except ImportError:
+        print("Falta pytz. Instala con: pip3 install pytz")
+        sys.exit(1)
+
+    main()
