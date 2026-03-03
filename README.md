@@ -1,6 +1,8 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)
 
+## 👤 Autor
+
 **José Ulloa**  
 Ingeniero Civil Informatico, Magister en Ingenieria Informatica.
 
@@ -174,10 +176,3 @@ No constituye asesoría financiera ni recomendación de inversión.
 El usuario asume toda responsabilidad por las decisiones tomadas con
 base en este análisis.
 
-
-------------------------------------------------------------------------
-
-## 👤 Autor
-
-Proyecto personal de análisis cuantitativo aplicado al tipo de cambio
-USD/CLP.
