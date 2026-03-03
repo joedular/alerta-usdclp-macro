@@ -596,10 +596,10 @@ def build_ml_dataset(daily: pd.DataFrame, macro_df: pd.DataFrame, horizon_days: 
     ]
     return df[features + ["y_up_5d"]].dropna()
 
-def fit_predict_prob(daily: pd.DataFrame, macro_df: pd.DataFrame) -> Tuple[float, str]:
+def fit_predict_prob(daily: pd.DataFrame, macro_df: pd.DataFrame) -> Tuple[float, float, str]:
     dataset = build_ml_dataset(daily, macro_df, horizon_days=5)
     if len(dataset) < 180:
-        return np.nan, f"ML: datos insuficientes ({len(dataset)} filas)."
+        return np.nan, np.nan, f"ML: datos insuficientes ({len(dataset)} filas)."
 
     X = dataset.drop(columns=["y_up_5d"]).values
     y = dataset["y_up_5d"].values
@@ -614,10 +614,16 @@ def fit_predict_prob(daily: pd.DataFrame, macro_df: pd.DataFrame) -> Tuple[float
     ])
     model.fit(X_train, y_train)
 
-    prob_up = float(model.predict_proba(X_last)[0, 1])
+    proba = model.predict_proba(X_last)[0]          # [P(class=0), P(class=1)]
+    prob_down = float(proba[0])                     # y_up_5d = 0  (no sube)
+    prob_up = float(proba[1])                       # y_up_5d = 1  (sube)
+
     base_rate = float(y_train.mean())
-    dbg = f"ML: prob_up_5d={prob_up:.2f} (base_rate_train={base_rate:.2f}, n_train={len(y_train)})"
-    return prob_up, dbg
+    dbg = (
+        f"ML: prob_up_5d={prob_up:.2f} | prob_down_5d={prob_down:.2f} "
+        f"(base_rate_train={base_rate:.2f}, n_train={len(y_train)})"
+    )
+    return prob_up, prob_down, dbg
 
 
 # =========================
@@ -777,7 +783,7 @@ def main():
     action, rationale = apply_market_hours_gate(action0, rationale0, now, force=args.force, learned_hours=learned_hours)
 
     # ML
-    prob_up_5d, ml_dbg = fit_predict_prob(daily, macro_df)
+    prob_up_5d, prob_down_5d, ml_dbg = fit_predict_prob(daily, macro_df)
 
     if np.isfinite(prob_up_5d):
         if prob_up_5d >= PROB_HIGH and action == "ESPERAR":
@@ -907,10 +913,12 @@ def main():
     print()
 
     print(bold("ML (probabilidad simple)"))
-    if np.isfinite(prob_up_5d):
-        print(f"Probabilidad de SUBIR en 5 días: {prob_up_5d:.2f}")
+    if np.isfinite(prob_up_5d) and np.isfinite(prob_down_5d):
+        print(f"Probabilidad de SUBIR en 5 días:  {prob_up_5d:.2f}")
+        print(f"Probabilidad de BAJAR (o no subir) en 5 días: {prob_down_5d:.2f}")
     else:
-        print("Probabilidad de SUBIR en 5 días: n/a")
+        print("Probabilidad de SUBIR en 5 días:  n/a")
+        print("Probabilidad de BAJAR (o no subir) en 5 días: n/a")
     print(ml_dbg)
     print()
 
